@@ -1,0 +1,9 @@
+venv/
+data/
+out/
+out_check/
+results/
+__pycache__/
+*.pyc
+.vscode/
+magu.zip
