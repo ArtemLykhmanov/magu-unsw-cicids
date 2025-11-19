@@ -384,6 +384,7 @@ def main() -> None:
                 cv_folds=args.cv_folds,
                 test_size=args.test_size,
                 gui_progress=args.gui_progress,
+                 reuse_models=args.reuse_models,
             )
     finally:
         sys.stdout = orig_stdout

@@ -12,6 +12,9 @@ import re
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
@@ -57,6 +60,44 @@ def _make_scenarios(project_root: Path) -> Dict[str, Scenario]:
             "--cv-folds",
             str(cv_folds),
             "--gui-progress",
+        ]
+
+    def single_csv_train_cmd(outdir: str, target_fpr: float, models_sel: List[str], cv_folds: int, dataset_path: str | None) -> List[str]:
+        models_arg = ",".join(models_sel) if models_sel else ""
+        csv_arg = dataset_path or ""
+        return [
+            sys.executable,
+            "-u",
+            str(project_root / "experiments" / "single_dataset_train_models.py"),
+            "--root",
+            root_str,
+            "--csv",
+            csv_arg,
+            "--outdir",
+            outdir,
+            "--models",
+            models_arg,
+            "--target-fpr",
+            str(target_fpr),
+        ]
+
+    def single_csv_eval_models_cmd(outdir: str, target_fpr: float, models_sel: List[str], cv_folds: int, dataset_path: str | None) -> List[str]:
+        models_arg = ",".join(models_sel) if models_sel else ""
+        csv_arg = dataset_path or ""
+        return [
+            sys.executable,
+            "-u",
+            str(project_root / "experiments" / "single_dataset_eval_models.py"),
+            "--root",
+            root_str,
+            "--csv",
+            csv_arg,
+            "--outdir",
+            outdir,
+            "--models",
+            models_arg,
+            "--target-fpr",
+            str(target_fpr),
         ]
 
     def unsw_standard_cmd(outdir: str, target_fpr: float, models_sel: List[str], cv_folds: int, dataset_path: str | None) -> List[str]:
@@ -347,6 +388,39 @@ def _make_scenarios(project_root: Path) -> Dict[str, Scenario]:
                 default_models=["rf", "logreg", "mlp", "hgb", "rf_cal", "xgb"],
                 requires_dataset=True,
             ),
+        "Single CSV (train models)":
+            Scenario(
+                label="Single CSV (train models)",
+                build_cmd=single_csv_train_cmd,
+                default_outdir="out/models/single_models",
+                default_target_fpr=0.01,
+                default_cv_folds=3,
+                default_models=["rf", "logreg", "mlp", "hgb", "rf_cal", "xgb"],
+                requires_dataset=True,
+                supports_cv_folds=False,
+            ),
+        "Single CSV (eval with models)":
+            Scenario(
+                label="Single CSV (eval with models)",
+                build_cmd=single_csv_eval_models_cmd,
+                default_outdir="out/single_models_eval",
+                default_target_fpr=0.01,
+                default_cv_folds=3,
+                default_models=["rf", "logreg", "mlp", "hgb", "rf_cal", "xgb"],
+                requires_dataset=True,
+                supports_cv_folds=False,
+            ),
+        "Extend models (train + finetune)":
+            Scenario(
+                label="Extend models (train + finetune)",
+                build_cmd=single_csv_cmd,  # not used; command built in GUI
+                default_outdir="out/models/single_models",
+                default_target_fpr=0.01,
+                default_cv_folds=3,
+                default_models=["rf", "logreg", "mlp", "hgb", "rf_cal", "xgb"],
+                requires_dataset=True,
+                supports_cv_folds=False,
+            ),
         "Cross CSV (train->test)":
             Scenario(
                 label="Cross CSV (train->test)",
@@ -528,6 +602,11 @@ class App(tk.Tk):
                 "UNSW models for McNemar",
                 "UNSW SHAP stability",
                 "UNSW feature ablation",
+                "Model training / eval",
+            ],
+            # New group dedicated to model training/extension workflows
+            "Model extension": [
+                "Model extension",
             ],
             "Custom / dataset-based": [
                 "Single CSV (generic)",
@@ -563,6 +642,14 @@ class App(tk.Tk):
             "UNSW feature ablation": {
                 "RF ablation": "UNSW feature selection ablation (RF)",
             },
+            "Model training / eval": {
+                "Single CSV: train models": "Single CSV (train models)",
+                "Single CSV: eval with models": "Single CSV (eval with models)",
+            },
+            "Model extension": {
+                "Train on single CSV": "Single CSV (train models)",
+                "Extend with new data (harmonized)": "Extend models (train + finetune)",
+            },
             "Single CSV (generic)": {
                 "Default": "Single CSV (generic)",
             },
@@ -577,6 +664,7 @@ class App(tk.Tk):
         self._current_process: subprocess.Popen | None = None
         self._runner_thread: threading.Thread | None = None
         self._start_time: float | None = None
+        self._last_run_outdir: Path | None = None
 
         self.model_keys: List[str] = ["rf", "rf_cal", "logreg", "hgb", "mlp", "xgb"]
         self.model_vars: Dict[str, tk.BooleanVar] = {}
@@ -707,6 +795,14 @@ class App(tk.Tk):
         self.load_cfg_btn = tk.Button(buttons_frame, text="Load config", command=self._on_load_config)
         self.load_cfg_btn.pack(side=tk.LEFT, padx=5)
 
+        self.view_last_btn = tk.Button(
+            buttons_frame,
+            text="View last results",
+            command=self._open_last_results,
+            state=tk.DISABLED,
+        )
+        self.view_last_btn.pack(side=tk.LEFT, padx=5)
+
         self.status_var = tk.StringVar()
         self.status_var.set("Ready.")
         status_label = tk.Label(buttons_frame, textvariable=self.status_var, anchor="w")
@@ -780,13 +876,11 @@ class App(tk.Tk):
         self.scenario_family_var.set(names[0])
 
     def _update_variant_menu(self) -> None:
-        group = self.group_var.get()
         family = self.scenario_family_var.get()
         menu = self.variant_menu["menu"]
         menu.delete(0, "end")
-        if group == "Preconfigured":
-            variants = list(self.scenario_variants.get(family, {}).keys())
-        else:
+        variants = list(self.scenario_variants.get(family, {}).keys())
+        if not variants:
             variants = ["Default"]
         if not variants:
             self.variant_var.set("")
@@ -808,13 +902,9 @@ class App(tk.Tk):
         self._apply_scenario_defaults()
 
     def _apply_scenario_defaults(self) -> None:
-        group = self.group_var.get()
-        if group == "Preconfigured":
-            family = self.scenario_family_var.get()
-            variant = self.variant_var.get()
-            key = self.scenario_variants.get(family, {}).get(variant)
-        else:
-            key = self.scenario_family_var.get()
+        family = self.scenario_family_var.get()
+        variant = self.variant_var.get()
+        key = self.scenario_variants.get(family, {}).get(variant, family)
         scenario = self.scenarios.get(key)
         if not scenario:
             return
@@ -832,8 +922,10 @@ class App(tk.Tk):
         state_cv = tk.NORMAL if scenario.supports_cv_folds else tk.DISABLED
         self.cv_folds_entry.config(state=state_cv)
 
-        # Finetune field: enabled only for Cross CSV finetune scenario
-        if scenario.label.startswith("Cross CSV (train->test + finetune)"):
+        # Finetune field: enabled for Cross CSV finetune and extend-models scenarios
+        if scenario.label.startswith("Cross CSV (train->test + finetune)") or scenario.label.startswith(
+            "Extend models"
+        ):
             self.finetune_entry.config(state=tk.NORMAL)
             # default 10% if empty
             if not self.finetune_var.get().strip():
@@ -855,8 +947,8 @@ class App(tk.Tk):
                 self.test_dataset_entry.config(state=tk.DISABLED)
                 self.test_dataset_browse_btn.config(state=tk.DISABLED)
                 self.test_submit_btn.config(state=tk.DISABLED)
-            elif scenario.label.startswith("Cross CSV"):
-                # Cross CSV: both train and test fields enabled
+            elif scenario.label.startswith("Cross CSV") or scenario.label.startswith("Extend models"):
+                # Cross CSV / extend-models: both train and test fields enabled
                 self.dataset_entry.config(state=tk.NORMAL)
                 self.dataset_browse_btn.config(state=tk.NORMAL)
                 self.train_submit_btn.config(state=tk.NORMAL)
@@ -1233,6 +1325,19 @@ class App(tk.Tk):
             messagebox.showerror("Error", "Output directory must not be empty.")
             return
 
+        # For eval-with-models scenario, require user to point to an existing models directory
+        if scenario.label.startswith("Single CSV (eval with models)"):
+            out_path = Path(outdir)
+            if not out_path.is_absolute():
+                out_path = (self.project_root / out_path).resolve()
+            if not out_path.exists():
+                messagebox.showerror(
+                    "Error",
+                    "For 'Single CSV (eval with models)', please set Output directory to an existing "
+                    "folder that contains trained models (e.g. from 'Single CSV (train models)').",
+                )
+                return
+
         dataset_path: str | None
         if scenario.requires_dataset:
             dataset_path = self.dataset_var.get().strip()
@@ -1262,7 +1367,7 @@ class App(tk.Tk):
                     dataset_labels.append(self.train_csv_paths[0])
                 if self.test_csv_paths:
                     dataset_labels.append(self.test_csv_paths[0])
-        if outdir == scenario.default_outdir:
+        if outdir == scenario.default_outdir and not scenario.label.startswith("Extend models"):
             outdir = self._make_run_outdir(
                 base_outdir=base_outdir,
                 scenario_label=label_for_outdir,
@@ -1270,8 +1375,49 @@ class App(tk.Tk):
                 dataset_labels=dataset_labels,
             )
 
+        try:
+            out_path = Path(outdir)
+            if not out_path.is_absolute():
+                out_path = (self.project_root / out_path).resolve()
+            self._last_run_outdir = out_path
+        except Exception:
+            self._last_run_outdir = None
+        if hasattr(self, "view_last_btn"):
+            self.view_last_btn.config(state=tk.DISABLED)
+
+        # Special handling for extend-models custom scenario
+        if scenario.label.startswith("Extend models"):
+            if not self.train_csv_paths:
+                messagebox.showerror("Error", "Please submit at least one train CSV path.")
+                return
+            base_models_outdir = outdir
+            cmd = [
+                sys.executable,
+                "-u",
+                str(self.project_root / "experiments" / "extend_models.py"),
+                "--root",
+                str(self.project_root),
+                "--base-outdir",
+                base_models_outdir,
+                "--models",
+                ",".join(selected_models),
+                "--target-fpr",
+                str(target_fpr),
+            ]
+            for p in self.train_csv_paths:
+                cmd.extend(["--train-csv", p])
+            # Optional finetune CSVs and fraction
+            for p in self.test_csv_paths:
+                cmd.extend(["--finetune-csv", p])
+            ft_val = self.finetune_var.get().strip()
+            if ft_val:
+                cmd.extend(["--finetune-frac", ft_val])
+            if not self.extra_plots_var.get():
+                cmd.append("--no-extra-plots")
+            if not self.feature_importance_var.get():
+                cmd.append("--no-feature-importance")
         # Special handling for cross-dataset custom scenario
-        if scenario.label.startswith("Cross CSV"):
+        elif scenario.label.startswith("Cross CSV"):
             if not self.train_csv_paths or not self.test_csv_paths:
                 messagebox.showerror("Error", "Please submit both train and test CSV paths.")
                 return
@@ -1306,7 +1452,6 @@ class App(tk.Tk):
                 cmd.append("--no-feature-importance")
         else:
             cmd = scenario.build_cmd(outdir, target_fpr, selected_models, cv_folds, dataset_path)
-
         if not self.extra_plots_var.get():
             cmd.append("--no-extra-plots")
         if not self.feature_importance_var.get():
@@ -1370,8 +1515,14 @@ class App(tk.Tk):
             self._append_log(f"\nProcess finished with exit code {exit_code}.\n")
             if exit_code == 0:
                 messagebox.showinfo("Done", "Experiment finished successfully.")
+                self._populate_results_for_last_run()
+                if self._last_run_outdir is not None and self._last_run_outdir.exists():
+                    if hasattr(self, "view_last_btn"):
+                        self.view_last_btn.config(state=tk.NORMAL)
             else:
                 messagebox.showwarning("Finished with errors", f"Experiment finished with exit code {exit_code}.")
+                if hasattr(self, "view_last_btn"):
+                    self.view_last_btn.config(state=tk.DISABLED)
 
         self._current_process = None
         self._start_time = None
@@ -1380,6 +1531,48 @@ class App(tk.Tk):
         self.status_var.set("Ready.")
         self.progress.stop()
         self.progress["value"] = 0
+
+    def _open_last_results(self) -> None:
+        if self._last_run_outdir is None or not self._last_run_outdir.exists():
+            messagebox.showerror("Results", "No results folder for the last run.")
+            return
+        try:
+            subprocess.Popen(["explorer", str(self._last_run_outdir)])
+        except Exception as e:
+            messagebox.showerror("Results", f"Failed to open results folder:\n{e}")
+
+    def _populate_results_for_last_run(self) -> None:
+        if self._last_run_outdir is None:
+            return
+        tables_dir = self._last_run_outdir / "tables"
+        if not tables_dir.exists():
+            return
+
+        preferred_files = [
+            "table_unsw_summary.csv",
+            "table_single_cv.csv",
+            "table_unsw_test.csv",
+            "table_cicids_cross_day.csv",
+            "table_cross_dataset.csv",
+        ]
+
+        chosen: Path | None = None
+        for name in preferred_files:
+            candidate = tables_dir / name
+            if candidate.exists():
+                chosen = candidate
+                break
+
+        if chosen is None:
+            return
+
+        try:
+            rel = chosen.resolve().relative_to(self.project_root.resolve())
+            self.results_csv_var.set(str(rel))
+        except Exception:
+            self.results_csv_var.set(str(chosen))
+
+        self._load_results_csv()
 
     def _copy_log_to_clipboard(self) -> None:
         try:

@@ -27,6 +27,12 @@ from src.metrics_ext import (  # type: ignore
     brier,
 )
 from src.eval_utils import threshold_for_target_fpr  # type: ignore
+from src.plots import (  # type: ignore
+    pr_curve_overlay,
+    roc_curve_overlay,
+    reliability_diagram,
+    f1_vs_threshold_curve,
+)
 
 from experiments.eval_cross_many import (  # type: ignore
     check_data_leakage,
@@ -269,6 +275,8 @@ def run_unsw_cv_and_test_present(
     target_fpr: float,
     cv_folds: int = 3,
     gui_progress: bool = False,
+    extra_plots: bool = True,
+    feature_importance: bool = True,
 ) -> None:
     print("=== UNSW CV + test experiment (presentation run) ===")
     print()
@@ -311,6 +319,9 @@ def run_unsw_cv_and_test_present(
 
     tables_dir = outdir / "tables"
     tables_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir = outdir / "figures"
+    if extra_plots:
+        figures_dir.mkdir(parents=True, exist_ok=True)
 
     # Suspicious-feature leakage scan and drop
     suspicious_cols: List[str] = []
@@ -405,6 +416,7 @@ def run_unsw_cv_and_test_present(
     print("[4/5] Training on full UNSW train and evaluating on UNSW test...")
     print(f"       Target FPR for threshold selection: {target_fpr}")
     rows_test: List[Dict[str, Any]] = []
+    proba_by_model: Dict[str, np.ndarray] = {}
     tau_explained = False
     calib_explained = False
 
@@ -459,6 +471,9 @@ def run_unsw_cv_and_test_present(
                 proba_te = expit(pipe.decision_function(Xte))
                 proba_va = expit(pipe.decision_function(X_va))
 
+        # store test probabilities for later plotting
+        proba_by_model[model_name] = proba_te
+
         tau = threshold_for_target_fpr(y_va, proba_va, target_fpr)
         if not tau_explained:
             _explain_tau_example(y_va, proba_va, target_fpr)
@@ -498,6 +513,39 @@ def run_unsw_cv_and_test_present(
     print()
     print(f"       Saved test evaluation table to: {test_path}")
     print()
+
+    # Optional diagnostic plots similar to eval_cross_many UNSW run
+    if extra_plots and proba_by_model:
+        try:
+            best_model = max(rows_test, key=lambda r: r["pr_auc"])["model"]
+            best_proba = proba_by_model.get(best_model)
+            if best_proba is not None:
+                reliability_diagram(
+                    yte.values,
+                    best_proba,
+                    10,
+                    str(figures_dir / f"reliability_{best_model}.png"),
+                )
+                f1_vs_threshold_curve(
+                    yte.values,
+                    best_proba,
+                    str(figures_dir / f"f1_vs_threshold_{best_model}.png"),
+                )
+        except Exception:
+            pass
+        try:
+            pr_curve_overlay(
+                yte.values,
+                {m: proba for m, proba in proba_by_model.items() if len(proba) == len(yte)},
+                str(figures_dir / "pr_curve_overlay.png"),
+            )
+            roc_curve_overlay(
+                yte.values,
+                {m: proba for m, proba in proba_by_model.items() if len(proba) == len(yte)},
+                str(figures_dir / "roc_curve_overlay.png"),
+            )
+        except Exception:
+            pass
 
     try:
         df_sum = pd.merge(df_cv, df_test, on="model", how="outer", suffixes=("_cv", "_test"))
@@ -562,7 +610,16 @@ def main() -> None:
     outdir = args.outdir
     models_sel = [m.strip() for m in args.models.split(",") if m.strip()]
 
-    run_unsw_cv_and_test_present(paths, outdir, models_sel, args.target_fpr, args.cv_folds, args.gui_progress)
+    run_unsw_cv_and_test_present(
+        paths,
+        outdir,
+        models_sel,
+        args.target_fpr,
+        args.cv_folds,
+        args.gui_progress,
+        extra_plots=not args.no_extra_plots,
+        feature_importance=not args.no_feature_importance,
+    )
 
 
 if __name__ == "__main__":

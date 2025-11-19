@@ -10,6 +10,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.inspection import permutation_importance
 import json
+import unicodedata
+import re
 
 from src.config import Paths, SEED
 from src.data_io import load_csv, unsw_files, cicids_day_files
@@ -17,7 +19,6 @@ from src.preprocess import build_preprocessor, infer_feature_types
 from src.models import make_models
 from src.metrics_ext import pr_auc, roc_auc, f1_at_threshold, expected_calibration_error, brier
 from src.eval_utils import threshold_for_target_fpr, save_manifest, compute_shap_feature_importance
-import unicodedata, re
 from src.plots import (
     pr_curve_overlay,
     roc_curve_overlay,
@@ -25,6 +26,25 @@ from src.plots import (
     f1_vs_threshold_curve,
     bar_pr_auc_by_pair,
 )
+
+
+class ProgressReporter:
+    """Print simple machine-readable progress markers for the GUI."""
+
+    def __init__(self, total_steps: int | None = None) -> None:
+        self.total_steps = int(total_steps) if total_steps and total_steps > 0 else 0
+        self.done = 0
+
+    def step(self, label: str = "") -> None:
+        if self.total_steps <= 0:
+            return
+        self.done += 1
+        if self.done > self.total_steps:
+            self.total_steps = self.done
+        try:
+            print(f"[GUI_PROGRESS] {self.done} {self.total_steps} {label}")
+        except Exception:
+            pass
 
 
 def check_data_leakage(X_a: pd.DataFrame, X_b: pd.DataFrame) -> None:
@@ -79,6 +99,76 @@ def write_leakage_report(outdir: Path, Xtr: pd.DataFrame, Xte_before: pd.DataFra
     }
     with open(logs / "leakage_report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
+
+
+def _single_feature_auc(s: pd.Series, y: pd.Series) -> float:
+    """Compute ROC-AUC of a single feature against binary labels.
+
+    Categorical features are encoded via mean label per category.
+    """
+    try:
+        if s.dtype == "O" or str(s.dtype).startswith("category"):
+            tmp = pd.DataFrame({"s": s.astype(str), "y": y.values})
+            rates = tmp.groupby("s", dropna=False)["y"].mean()
+            x = s.astype(str).map(rates).astype(float)
+        else:
+            x = pd.to_numeric(s, errors="coerce")
+        x = x.replace([np.inf, -np.inf], np.nan)
+        if x.isna().all():
+            return float("nan")
+        xm = x.fillna(x.median())
+        if xm.nunique() <= 1 or y.nunique() <= 1:
+            return float("nan")
+        return float(roc_auc(y.values, xm.values))
+    except Exception:
+        return float("nan")
+
+
+def suspicious_feature_scan(
+    Xtr: pd.DataFrame,
+    ytr: pd.Series,
+    outdir: Path,
+    prefix: str,
+    Xte: pd.DataFrame | None = None,
+    yte: pd.Series | None = None,
+) -> pd.DataFrame:
+    """Scan features for near-perfect single-feature AUC (potential leakage).
+
+    Writes a CSV under outdir/tables with per-feature AUCs and a 'suspicious' flag.
+    """
+    rows: list[dict] = []
+    for col in Xtr.columns:
+        auc_tr = _single_feature_auc(Xtr[col], ytr)
+        auc_te = float("nan")
+        if Xte is not None and yte is not None and col in Xte.columns:
+            auc_te = _single_feature_auc(Xte[col], yte)
+        suspicious = (
+            isinstance(auc_tr, (float, np.floating))
+            and not np.isnan(auc_tr)
+            and auc_tr >= 0.995
+        )
+        if not np.isnan(auc_te):
+            suspicious = suspicious or auc_te >= 0.995
+        rows.append(
+            {
+                "feature": str(col),
+                "auc_train": float(auc_tr) if not np.isnan(auc_tr) else float("nan"),
+                "auc_test": float(auc_te) if not np.isnan(auc_te) else float("nan"),
+                "suspicious": bool(suspicious),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    try:
+        tables_dir = outdir / "tables"
+        tables_dir.mkdir(parents=True, exist_ok=True)
+        safe_prefix = str(prefix).strip().replace(" ", "_")
+        path = tables_dir / f"table_{safe_prefix}_suspicious_features.csv"
+        df.to_csv(path, index=False)
+    except Exception:
+        # Scanning is diagnostic only; failures should not kill the main run.
+        pass
+    return df
 
 
 def _pre_feature_mapping(pre) -> tuple[list[str], list[str]]:
@@ -179,7 +269,7 @@ def _permutation_importances_agg(model_name: str, est, pre, X_val: pd.DataFrame,
         return []
 
 
-def run_unsw_cv_and_test(paths: Paths, outdir: Path, models_sel, target_fpr: float):
+def run_unsw_cv_and_test(paths: Paths, outdir: Path, models_sel, target_fpr: float, cv_folds: int = 3, gui_progress: bool = False):
     files = unsw_files(paths.data)
     Xtr, ytr = load_csv(files["train"])  # label conversion inside
     Xte, yte = load_csv(files["test"])   
@@ -204,10 +294,15 @@ def run_unsw_cv_and_test(paths: Paths, outdir: Path, models_sel, target_fpr: flo
     figures_dir.mkdir(parents=True, exist_ok=True)
 
     # Cross-validation on train
-    kf = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED)
+    all_models = [name for name in make_models().keys() if (not models_sel or name in models_sel)]
+    n_splits = cv_folds if isinstance(cv_folds, int) and cv_folds >= 2 else 3
+    total_steps = len(all_models) * (n_splits + 1) if all_models else 0
+    progress = ProgressReporter(total_steps if (gui_progress and total_steps > 0) else None)
+
+    kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=SEED)
     rows_cv: list[dict] = []
     for model_name, model in make_models().items():
-        if models_sel and model_name not in models_sel:
+        if all_models and model_name not in all_models:
             continue
         scores = []
         f1s = []
@@ -228,6 +323,7 @@ def run_unsw_cv_and_test(paths: Paths, outdir: Path, models_sel, target_fpr: flo
                 proba = pipe.predict_proba(X_va)[:, 1]
             scores.append(pr_auc(y_va, proba))
             f1s.append(f1_at_threshold(y_va, proba, 0.5))
+            progress.step(f"unsw_cv_fold {model_name} {len(scores)}")
         rows_cv.append({
             "model": model_name,
             "pr_auc_mean": float(np.mean(scores)),
@@ -250,7 +346,7 @@ def run_unsw_cv_and_test(paths: Paths, outdir: Path, models_sel, target_fpr: flo
             pass
 
     for model_name, model in make_models().items():
-        if models_sel and model_name not in models_sel:
+        if all_models and model_name not in all_models:
             continue
         try:
             pre_final = build_preprocessor(Xtr)
@@ -314,6 +410,7 @@ def run_unsw_cv_and_test(paths: Paths, outdir: Path, models_sel, target_fpr: flo
             pr_by_model[model_name] = row["pr_auc"]
             proba_by_model[model_name] = proba_te
             print(f"Saved results for model: {model_name}")
+            progress.step(f"unsw_test {model_name}")
         except Exception as e:
             print(f"Warning: failed to evaluate model {model_name}: {e}")
 
@@ -377,6 +474,48 @@ def run_unsw_cv_and_test(paths: Paths, outdir: Path, models_sel, target_fpr: flo
                 pass
     except Exception as e:
         print(f"Warning: failed to write summary table: {e}")
+
+
+def _load_unsw_summary_row(outdir: Path, model_name: str) -> dict | None:
+    """Load a single model row from UNSW summary table under given outdir."""
+    path = outdir / "tables" / "table_unsw_summary.csv"
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+    if "model" not in df.columns:
+        return None
+    df_m = df[df["model"] == model_name]
+    if df_m.empty:
+        return None
+    try:
+        return df_m.iloc[0].to_dict()
+    except Exception:
+        return None
+
+
+def print_unsw_repro_comparison(baseline_outdir: Path, current_outdir: Path, model_name: str) -> None:
+    """Print simple metric comparison between baseline and current UNSW runs for a given model."""
+    base_row = _load_unsw_summary_row(baseline_outdir, model_name)
+    cur_row = _load_unsw_summary_row(current_outdir, model_name)
+    if base_row is None or cur_row is None:
+        print("Repro-check: unable to load UNSW summary tables for comparison; skipping.")
+        return
+
+    print()
+    print(f"Repro-check for UNSW model '{model_name}':")
+    metrics = ["pr_auc", "roc_auc", "f1@0.5", "f1@tau", "ece", "brier"]
+    for m in metrics:
+        if m in base_row and m in cur_row:
+            try:
+                b = float(base_row[m])
+                c = float(cur_row[m])
+            except Exception:
+                continue
+            delta = c - b
+            print(f"  {m}: baseline={b:.6f}, current={c:.6f}, delta={delta:+.6f}")
 
 
 def run_cicids_cross_day(paths: Paths, outdir: Path, models_sel, target_fpr: float, val_day: str | None):
@@ -504,6 +643,15 @@ def main():
     ap.add_argument('--models', default='rf,logreg,mlp,hgb,rf_cal,xgb')
     ap.add_argument('--target-fpr', type=float, default=0.01)
     ap.add_argument('--val', default='monday', help='validation set for cicids_cross_day (monday|tuesday|...)')
+    # Extra flags used by GUI scenarios (some are currently informational / ignored)
+    ap.add_argument('--cv-folds', type=int, default=3)
+    ap.add_argument('--gui-progress', action='store_true')
+    ap.add_argument('--pairs', default=None, help='Comma-separated CICIDS test pairs (e.g. thursday_web,friday_ddos)')
+    ap.add_argument('--subsample', type=int, default=None, help='Optional subsample size for CICIDS repro scenarios')
+    ap.add_argument('--calibrate-all', action='store_true', help='Calibrate all models where applicable')
+    ap.add_argument('--align', default=None, help='Alignment mode for cross_dataset scenarios')
+    ap.add_argument('--compare-to', default=None, help='Baseline outdir for repro-check scenarios')
+    ap.add_argument('--compare-model', default=None, help='Model name to compare against baseline')
     args = ap.parse_args()
 
     paths = Paths.from_root(args.root)
@@ -512,7 +660,24 @@ def main():
     save_manifest(outdir, vars(args))
 
     if args.scenario == 'unsw_cv_test':
-        run_unsw_cv_and_test(paths, outdir, models_sel, args.target_fpr)
+        run_unsw_cv_and_test(
+            paths,
+            outdir,
+            models_sel,
+            args.target_fpr,
+            cv_folds=args.cv_folds,
+            gui_progress=args.gui_progress,
+        )
+        # Optional repro-check comparison for UNSW scenarios
+        if args.compare_to and args.compare_model:
+            try:
+                base_dir = Path(args.compare_to)
+                if not base_dir.is_absolute():
+                    base_dir = Path(paths.root) / base_dir  # type: ignore[attr-defined]
+                cur_dir = outdir if outdir.is_absolute() else Path(paths.root) / outdir  # type: ignore[attr-defined]
+                print_unsw_repro_comparison(base_dir, cur_dir, args.compare_model)
+            except Exception as e:
+                print(f"Warning: failed to run UNSW repro comparison: {e}")
     elif args.scenario == 'cicids_cross_day':
         run_cicids_cross_day(paths, outdir, models_sel, args.target_fpr, args.val)
     elif args.scenario == 'cross_dataset':
